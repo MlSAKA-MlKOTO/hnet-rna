@@ -20,8 +20,9 @@ ap.add_argument('-C', '--compile', choices=['block', 'eager'], help='attempt tor
 ap.add_argument('-o', '--optim', default='adamw', choices=['adamw', 'sgd'])
 ap.add_argument('--lr', type=float, default=3e-4, help='adamw learning rate')
 ap.add_argument('--mbs', type=int, default=1<<14, help='maximum microbatchsize (tokens per gpu)')
-ap.add_argument('--steps', type=int, default=1000, help='total train steps')
+ap.add_argument('--steps', type=int, default=1<<10, help='total train steps')
 ap.add_argument('--save-dir', type=str, help='overwriting output path to save checkpoints')
+ap.add_argument('--train-data-dir', type=str, default='./datasets/train', help='directory with finetune data')
 # n.b. about 76k steps required for 16ktok * 8gpu to reach 10Btok
 args = ap.parse_args()
 
@@ -51,8 +52,8 @@ from termcolor import colored
 
 from hnet_trainable import HNetLM, NJT, HNetConfig
 from fineweb import seqlen_sorted_fineweb
-from comparison import ByteTokenizer, generate, HNetLM as HNetLMInference, yield_utf8_chunks
-
+from comparison import generate, HNetLM as HNetLMInference, yield_utf8_chunks
+from tokenizer import RnaTokenizer
 
 ###
 ### distributed 
@@ -101,7 +102,7 @@ def summon_full_params(model: FSDPModule):
 ###
 ### tokenizer / configs
 n_compression = [int(s) for s in args.n_compression.split('-')]
-t = ByteTokenizer()
+t = RnaTokenizer()
 c = HNetConfig.load_config(args.config, N_compress=n_compression)
 def load_ckpt(m: nn.Module, path: str | None):
     if path is None: return # do not do anything
@@ -331,68 +332,119 @@ def train_step(iids, lbls, *, alpha=0.03):
     metrics = torch.stack([loss, loss_ce, loss_rt, bpb])
     return metrics.tolist() + [comp_ratios] # <-- cpu sync
 
-def seq2args(ls: list[bytes]) -> tuple[TT,TT]:
-    samples = [torch.tensor(bytearray(b),device='cuda',dtype=torch.int) for b in ls]
+# def seq2args(ls: list[bytes]) -> tuple[TT,TT]:
+#     samples = [torch.tensor(bytearray(b),device='cuda',dtype=torch.int) for b in ls]
+#     iids = NJT([s[:-1] for s in samples])
+#     lbls = NJT([s[1: ] for s in samples]).long()
+#     return iids, lbls
+
+def rna_dataloader(file_path: str, rank: int, wsize: int, msl: int = 1 << 15):
+    """
+    RNA from .txt
+    follow rank and wsize for split
+    """
+    lines=[]
+    for f_single in os.listdir(file_path):
+        if not f_single.endswith('.txt'):
+            continue
+        with open(os.path.join(file_path,f_single)) as f:
+            lines.extend(f.readlines())
+
+    lines_for_this_rank = lines[rank::wsize]
+    seqs, plen = [], 0
+    while True:
+        for line in lines_for_this_rank:
+            rna_seq = line.strip()
+            if not rna_seq:
+                continue
+
+            seq_len = len(rna_seq) + 2  # +2 means adding BOS and EOS token
+            
+            if plen + seq_len > msl:
+                yield seqs
+                seqs, plen = [rna_seq], seq_len
+            else:
+                seqs.append(rna_seq)
+                plen += seq_len
+        
+        # yield left seqs at the end of epoch 
+        if seqs:
+            yield seqs
+            seqs, plen = [], 0
+
+    
+def seq2args_rna(ls: list[str],tokenizer=t) -> tuple[TT, TT]:
+    """
+    transform RNA sequences into input and label tensors.
+    """
+    # add <bos> token and tokenization
+    tokenized_seqs = tokenizer.encode(ls, add_special_tokens=True)
+    
+    samples = [torch.tensor(seq['input_ids'], device='cuda', dtype=torch.int) for seq in tokenized_seqs]
+    
     iids = NJT([s[:-1] for s in samples])
-    lbls = NJT([s[1: ] for s in samples]).long()
+    lbls = NJT([s[1:] for s in samples]).long()
     return iids, lbls
 
+
 # add your own if needed; there are no other gpus in my observable reality
-gpuflops = {
-    'NVIDIA GeForce RTX 3090':71e12,
-    'NVIDIA GeForce RTX 4090':165.15e12,
-    'NVIDIA B200': 2250e12,
-}[torch.cuda.get_device_name()]
+# gpuflops = {
+#     'NVIDIA GeForce RTX 3090':71e12,
+#     'NVIDIA GeForce RTX 4090':165.15e12,
+#     'NVIDIA B200': 2250e12,
+#     'NVIDIA GeForce RTX 4060 Laptop GPU': 22.5e12,
+# }[torch.cuda.get_device_name()]
 
 
 assert_rng_equal(dist.group.WORLD) # <-- assumes node of homogenous GPUs
-pr0('start training')
-for step,batch in enumerate(seqlen_sorted_fineweb(r, ws, args.mbs)):
-    # train step
-    t_step = time.perf_counter()
-    iids, lbls = seq2args(batch)
-    loss, loss_ce, loss_rt, bpb, comp_ratios = train_step(iids, lbls)
+if __name__ == '__main__':
+    pr0('start training')
+    for step,batch in enumerate(rna_dataloader(args.train_data_dir,r, ws, args.mbs)):
+        # train step
+        t_step = time.perf_counter()
+        iids, lbls = seq2args_rna(batch)
+        loss, loss_ce, loss_rt, bpb, comp_ratios = train_step(iids, lbls)
 
-    # calc mfu (underestimate since we don't know avg seqlen)
-    batch_flops = m.flops(iids.values().shape[0], iids._max_seqlen)
-    t_delta = time.perf_counter() - t_step
-    mfu = batch_flops / (gpuflops*t_delta)
+        # calc mfu (underestimate since we don't know avg seqlen)
+        batch_flops = m.flops(iids.values().shape[0], iids._max_seqlen)
+        t_delta = time.perf_counter() - t_step
+        # mfu = batch_flops / (gpuflops*t_delta)
 
-    # Log (every 10steps)
-    lr_list = [mult*args.lr*get_lr_mult(step) for mult in lambda_s]
-    log_step = log if step % 10 == 0 else lambda d:0
-    log_step({
-        'step': step,
-        'batch_flops (overestimate)': batch_flops,
-        'mfu (underestimate)': mfu,
-        'bpb': bpb,
-        'loss/cross': loss_ce,
-        'loss/ratio': loss_rt,
-        'loss/total': loss,
-        **{f'Compression L{i+1}/L{i}':ratio for i,ratio in enumerate(comp_ratios)},
-        **{f'lr/{i}':lr for i,lr in enumerate(lr_list)},
-    })
+        # Log (every 10steps)
+        lr_list = [mult*args.lr*get_lr_mult(step) for mult in lambda_s]
+        log_step = log if step % 10 == 0 else lambda d:0
+        log_step({
+            'step': step,
+            'batch_flops (overestimate)': batch_flops,
+            # 'mfu (underestimate)': mfu,
+            'bpb': bpb,
+            'loss/cross': loss_ce,
+            'loss/ratio': loss_rt,
+            'loss/total': loss,
+            **{f'Compression L{i+1}/L{i}':ratio for i,ratio in enumerate(comp_ratios)},
+            **{f'lr/{i}':lr for i,lr in enumerate(lr_list)},
+        })
 
-    # Try sampling (every 100)
-    if step % 100 == 0:
-        pr0('generating...')
-        with summon_full_params(m) if isinstance(m, FSDPModule) else nullcontext():
-            with obscure_torch_wrapper_modules(m):
-                m_inf = create_inference_model_clone(m,c)
-            p = 'Hello world!'
-            with torch.autocast('cuda', torch.bfloat16, cache_enabled=False):
-                try: res1 = ''.join(
-                    colored(c, 'white' if i%2 else 'black', 'on_black' if i%2 else 'on_white')
-                    for i,c in enumerate(yield_utf8_chunks(generate(m_inf, p, 512)))
-                )
-                except UnicodeDecodeError: res1 = colored('[failed to decode UTF-8]', 'red')
-        pr0(colored(p, attrs=['underline']) + res1)
-        pr0('='*50)
+        # Try sampling (every 100)
+        if step % 100 == 0:
+            pr0('generating...')
+            with summon_full_params(m) if isinstance(m, FSDPModule) else nullcontext():
+                with obscure_torch_wrapper_modules(m):
+                    m_inf = create_inference_model_clone(m,c)
+                p = 'AUCGNCCCC'
+                with torch.autocast('cuda', torch.bfloat16, cache_enabled=False):
+                    try: res1 = ''.join(
+                        colored(c, 'white' if i%2 else 'black', 'on_black' if i%2 else 'on_white')
+                        for i,c in enumerate(yield_utf8_chunks(generate(m_inf, p, 512,tokenizer=t),tokenizer=t))
+                    )
+                    except UnicodeDecodeError: res1 = colored('[failed to decode UTF-8]', 'red')
+            pr0(colored(p, attrs=['underline']) + res1)
+            pr0('='*50)
 
 
-    # Try saving (every 1000)
-    if step % 1000 == 0:
-        save_ckpt(step) if args.save_dir else pr0(f"not saving checkpoint as {args.save_dir=}")
+        # Try saving (every 1000)
+        if step % 1000 == 0:
+            save_ckpt(step) if args.save_dir else pr0(f"not saving checkpoint as {args.save_dir=}")
 
-    if step == args.steps: break
+        if step == args.steps: break
 

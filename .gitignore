@@ -2,7 +2,8 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+.vscode/
+test.ipynb
 # C extensions
 *.so
 
@@ -20,6 +21,7 @@ parts/
 sdist/
 var/
 wheels/
+datasets/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
