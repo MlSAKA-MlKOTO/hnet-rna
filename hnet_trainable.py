@@ -152,7 +152,7 @@ class CausalMHA(nn.Module):
         assert _r == 0
         self.Wqkv = Lin(d, d*3)
         self.out_proj = Lin(d,d)
-        rope_cache = RotaryNeoX.rotary_cache(10000.0, rotary_emb_dim, 2048)
+        rope_cache = RotaryNeoX.rotary_cache(10000.0, rotary_emb_dim, 1<<15)
         self.register_buffer('rope_cache', torch.stack(rope_cache), persistent=False)
     def forward(self, x: TT, cu_seqlens: None | TT = None, max_seqlen: None | int = None):
         if x.layout == torch.jagged:

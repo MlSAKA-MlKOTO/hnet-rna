@@ -4,7 +4,7 @@
 # argparse first to make --help ASAP. please do not isort
 import argparse
 ap = argparse.ArgumentParser()
-ap.add_argument('-c', '--config', type=str, default='./configs/hnet_2stage_small.json')
+ap.add_argument('-c', '--config', type=str, default='./configs/hnet_2stage_L.json')
 ap.add_argument('-p', '--pt-ckpt', type=str, default=None, help='e.g. ./hnet_1stage_L.pt')
 ap.add_argument('-N', '--n-compression', type=str, default='1-3-9', help='''
 compression depth to target with L_ratio. this is a bit different from the paper's notation;
@@ -54,6 +54,8 @@ from hnet_trainable import HNetLM, NJT, HNetConfig
 from fineweb import seqlen_sorted_fineweb
 from comparison import generate, HNetLM as HNetLMInference, yield_utf8_chunks
 from tokenizer import RnaTokenizer
+import wandb
+
 
 ###
 ### distributed 
@@ -348,7 +350,7 @@ def rna_dataloader(file_path: str, rank: int, wsize: int, msl: int = 1 << 15):
         if not f_single.endswith('.txt'):
             continue
         with open(os.path.join(file_path,f_single)) as f:
-            lines.extend(f.readlines())
+            lines.extend([t.strip() for t in f.readlines()])
 
     lines_for_this_rank = lines[rank::wsize]
     seqs, plen = [], 0
@@ -359,7 +361,9 @@ def rna_dataloader(file_path: str, rank: int, wsize: int, msl: int = 1 << 15):
                 continue
 
             seq_len = len(rna_seq) + 2  # +2 means adding BOS and EOS token
-            
+            if seq_len > msl:
+                rna_seq = rna_seq[:msl-2]  # truncate to max sequence length
+                seq_len = msl
             if plen + seq_len > msl:
                 yield seqs
                 seqs, plen = [rna_seq], seq_len
