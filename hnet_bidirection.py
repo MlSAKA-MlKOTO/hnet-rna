@@ -17,6 +17,86 @@ from flash_attn import flash_attn_varlen_func
 # https://github.com/state-spaces/mamba/issues/740
 mamba2.mamba_split_conv1d_scan_combined = torch.compiler.disable(mamba2.mamba_split_conv1d_scan_combined)
 
+### ###########################
+### Bidirectional Mamba Wrapper
+### ###########################
+
+def flip_nested(nt: torch.Tensor, dims: tuple[int, ...]) -> torch.Tensor:
+    if not nt.is_nested:
+        return torch.flip(nt, dims=dims)  # For regular tensors, use torch.flip directly
+    dims_set = set(dims)
+    tensors = list(nt.unbind())
+    if 0 in dims_set:
+        raise NotImplementedError("Flipping along the batch dimension (dim=0) is not supported for Nested Tensors.")
+    if dims_set:
+        inner_dims = [d - 1 for d in dims_set]
+        flipped_tensors = [torch.flip(t, inner_dims) for t in tensors]
+    else:
+        flipped_tensors = tensors
+    
+    values=torch.cat(flipped_tensors,dim=0)
+    return nested.nested_tensor_from_jagged(values,offsets=nt.offsets())
+
+class BiMambaWrapper(nn.Module):
+    """Thin wrapper around Mamba to support bi-directionality."""
+
+    def __init__(
+            self,
+            d_model,
+            bidirectional: bool = True,
+            bidirectional_strategy: str = "add",
+            bidirectional_weight_tie: bool = False,
+            layer_idx: int = None,
+            **ssm_cfg
+    ):
+        super().__init__()
+        if bidirectional and bidirectional_strategy is None:
+            bidirectional_strategy = "add"  # Default strategy: `add`
+        if bidirectional and bidirectional_strategy not in ["add", "ew_multiply"]:
+            raise NotImplementedError(f"`{bidirectional_strategy}` strategy for bi-directionality is not implemented!")
+        self.bidirectional = bidirectional
+        self.bidirectional_strategy = bidirectional_strategy
+        self.mamba_fwd = mamba2.Mamba2(d_model,**ssm_cfg,layer_idx=layer_idx)
+        if bidirectional:
+            self.mamba_rev = mamba2.Mamba2(d_model,**ssm_cfg,layer_idx=layer_idx)
+            if bidirectional_weight_tie:  # Tie in and out projections (where most of param count lies)
+                self.mamba_rev.in_proj.weight = self.mamba_fwd.in_proj.weight
+                self.mamba_rev.in_proj.bias = self.mamba_fwd.in_proj.bias
+                self.mamba_rev.out_proj.weight = self.mamba_fwd.out_proj.weight
+                self.mamba_rev.out_proj.bias = self.mamba_fwd.out_proj.bias
+        else:
+            self.mamba_rev = None
+
+    def forward(self, u,seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
+        """Bidirectional-enabled forward pass
+
+        hidden_states: (B, L, D)
+        Returns: same shape as hidden_states
+        """
+        out = self.mamba_fwd(
+            u=u,
+            seqlen=seqlen, 
+            seq_idx=seq_idx, 
+            cu_seqlens=cu_seqlens, 
+            inference_params=inference_params
+        )
+        if self.bidirectional:
+            out_rev = flip_nested(self.mamba_rev(
+                u=flip_nested(u,dims=(1,)),  # Flip along the sequence length dimension
+                seqlen=seqlen, 
+                seq_idx=seq_idx, 
+                cu_seqlens=cu_seqlens, 
+                inference_params=inference_params
+            ),dims=(1,))  # Flip back for combining with forward hidden states
+            if self.bidirectional_strategy == "add":
+                out = out + out_rev
+            elif self.bidirectional_strategy == "ew_multiply":
+                out = out * out_rev
+            else:
+                raise NotImplementedError(f"`{self.bidirectional_strategy}` for bi-directionality not implemented!")
+        return out
+# self.mixer(x[None], seq_idx=seq_idx)[0]
+
 ### ################
 ### Extended NJT ops
 ### ################
@@ -143,12 +223,11 @@ class RotaryNeoX:
             interleaved=False, inplace=True, max_seqlen=cos.shape[0]
         )
 
-class CausalMHA(nn.Module):
+class FullMHA(nn.Module):
     def __init__(self, d: int, num_heads: int, rotary_emb_dim: int, window_size: int = -1):
         super().__init__()
         self.num_heads = num_heads
         self.d_head,_r = divmod(d,num_heads)
-        self.window_size = (window_size, 0)
         assert _r == 0
         self.Wqkv = Lin(d, d*3)
         self.out_proj = Lin(d,d)
@@ -168,8 +247,6 @@ class CausalMHA(nn.Module):
                     q.values(), k.values(), v.values(),
                     q.offsets().int(), k.offsets().int(),
                     q._get_max_seqlen(), k._get_max_seqlen(), 
-                    window_size=self.window_size,
-                    causal=True
                 ), q.offsets()
             )
         else:
@@ -179,8 +256,6 @@ class CausalMHA(nn.Module):
             o = flash_attn_varlen_func(
                 *qk.split(self.num_heads, dim=-2), v,
                 cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-                window_size=self.window_size,
-                causal=True
             )
         return self.out_proj(o.view(*x.shape))
 
@@ -196,7 +271,7 @@ class Block(nn.Module):
     def forward(self, x: TT, residual: TT | None, cu_seqlens: TT, max_seqlen: int, seq_idx: TT):
         # x, residual = self.norm1(x, residual=residual, prenorm=True, residual_in_fp32=True)
         x = F.rms_norm(residual:=x if residual is None else x+residual, x.shape[-1:], self.norm1.weight, self.norm1.eps)
-        if isinstance(self.mixer, mamba2.Mamba2): x = self.mixer(x[None], seq_idx=seq_idx)[0]
+        if isinstance(self.mixer, BiMambaWrapper): x = self.mixer(x[None], seq_idx=seq_idx)[0] # why 0？
         else: x = self.mixer(x, cu_seqlens.int(), max_seqlen)
         if self.norm2 is None: return x, residual
         x = F.rms_norm(residual:=x+residual, x.shape[-1:], self.norm2.weight, self.norm2.eps)
@@ -206,7 +281,7 @@ class Block(nn.Module):
         # Original NJT-based impl
         residual = x if residual is None else x+residual
         x = F.rms_norm(residual, x.shape[-1:], self.norm1.weight, self.norm1.eps)
-        if isinstance(self.mixer, mamba2.Mamba2):
+        if isinstance(self.mixer, BiMambaWrapper):
             seqlens = x.offsets().diff()
             p_pad = nested.to_padded_tensor(x, padding=0.0)
             p_pad = self.mixer(p_pad)
@@ -229,8 +304,8 @@ class Block(nn.Module):
     @classmethod
     def create(cls, arch: str, d: int, h: int, ssm_cfg: dict, attn_cfg: dict, layer_idx: int):
         mixer_cls = dict(
-            t=partial(CausalMHA, **attn_cfg),
-            m=partial(mamba2.Mamba2, **ssm_cfg, layer_idx=layer_idx)
+            t=partial(FullMHA, **attn_cfg),
+            m=partial(BiMambaWrapper, **ssm_cfg, layer_idx=layer_idx)
         )[arch.lower()]
         mlp_cls = partial(SwiGLU, h=h) if arch.isupper() else nn.Identity
         
@@ -285,7 +360,7 @@ class Isotropic(nn.Module):
         )
         attn = 4*d*(msl+2*d)
         return sum(
-            (attn if isinstance(l.mixer, CausalMHA) else mamba) +
+            (attn if isinstance(l.mixer, FullMHA) else mamba) +
             (0 if isinstance(l.mlp, nn.Identity) else mlp)
             for l in self.layers
         )
@@ -416,6 +491,8 @@ class DeChunkLayer(nn.Module):
         # 1-bf16[0.01111110.1111111] = 1-.99609375 ~= .004, so eps=4e-3
 
         z_bar_flat = self.ema_scan_njt(x,p) # njt -> flat values tensor
+        z_bar_flat_rev=flip_nested(self.ema_scan_njt(flip_nested(x,dims=(1,)),flip_nested(p,dims=(1,))),dims=(1,))
+        z_bar_flat = (z_bar_flat + z_bar_flat_rev) / 2
         inner2outer_idx = bpred.b.values().cumsum(0)-1
 
         return nested.nested_tensor_from_jagged(
@@ -641,7 +718,7 @@ if __name__ == "__main__":
     D = 1024
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device('cuda')
-    mha = CausalMHA(D, 8, 64)
+    mha = FullMHA(D, 8, 64)
 
     x = nested.nested_tensor([torch.randn(17,D), torch.randn(31,D)], requires_grad=True, layout=torch.jagged)
     mha(x).sum().backward()

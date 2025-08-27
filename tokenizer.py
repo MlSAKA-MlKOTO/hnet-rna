@@ -6,7 +6,7 @@ class RnaTokenizer:
         # Define the fixed RNA vocabulary and special tokens.
         self.special_tokens = ["<unk>", "<pad>", "<bos>", "<eos>"]
         self.base_vocab = ['A', 'U', 'C', 'G', 'N','T','R','Y','S','W','K','M','B','D','H','V']
-        self.ex_vocab=[]
+        self.ex_vocab=['<mask>']
         # 2. Build the complete vocabulary.
         self.vocab = {}
         # First, add the special tokens.
@@ -26,6 +26,7 @@ class RnaTokenizer:
         self.pad_idx = self.vocab["<pad>"]
         self.bos_idx = self.vocab["<bos>"]
         self.eos_idx = self.vocab["<eos>"]
+        self.mask_idx = self.vocab.get("<mask>", None)
         
     @property
     def vocab_size(self) -> int:
